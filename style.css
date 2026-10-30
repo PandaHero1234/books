@@ -11,6 +11,10 @@
   --dot-l: 36%;
   --road: #fbfaf6;
   --road-casing: #c3bfae;
+  --highway: #f3d27a;
+  --highway-casing: #d2a64a;
+  --bubble-text: #ffffff;
+  --bubble-ring: #ffffff;
   --ferry: #5d8592;
   --label: #23292c;
   --label-soft: #4f5e65;
@@ -35,6 +39,7 @@
     --ocean: #0e1a1f; --ocean-line: #15252c; --shallow: #12232a; --coast: #34525d;
     --land-s: 16%; --land-l: 21%; --dot-l: 72%;
     --road: #3d4b50; --road-casing: #151e22; --ferry: #6c97a4;
+    --highway: #7d6a3a; --highway-casing: #3a3121; --bubble-text: #0e1a1f; --bubble-ring: #0e1a1f;
     --label: #e4ebe8; --label-soft: #a9b9bc; --halo: #0e1a1f;
     --ui-bg: #172125; --ui-fg: #e7eeec; --ui-muted: #9cadb1; --ui-line: #28363b; --ui-hover: #1f2c31;
     --pin: #e0705a; --pin-ink: #172125; --route: #76aef0; --route-soft: #1c2e40;
@@ -46,6 +51,7 @@
   --ocean: #0e1a1f; --ocean-line: #15252c; --shallow: #12232a; --coast: #34525d;
   --land-s: 16%; --land-l: 21%; --dot-l: 72%;
   --road: #3d4b50; --road-casing: #151e22; --ferry: #6c97a4;
+    --highway: #7d6a3a; --highway-casing: #3a3121; --bubble-text: #0e1a1f; --bubble-ring: #0e1a1f;
   --label: #e4ebe8; --label-soft: #a9b9bc; --halo: #0e1a1f;
   --ui-bg: #172125; --ui-fg: #e7eeec; --ui-muted: #9cadb1; --ui-line: #28363b; --ui-hover: #1f2c31;
   --pin: #e0705a; --pin-ink: #172125; --route: #76aef0; --route-soft: #1c2e40;
@@ -181,6 +187,7 @@ button { font: inherit; color: inherit; }
 .cover .book .ba { font-size: 9px; font-style: italic; opacity: .85; }
 .cover .book img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .cover .where { color: #fbf8f0; font: italic 500 15px/1.3 var(--font-map); text-shadow: 0 1px 2px rgba(0,0,0,.35); min-width: 0; }
+.cover .where .big { display: block; font: 600 26px/1.15 var(--font-map); font-style: normal; text-wrap: balance; }
 .cover .where small { display: block; font: 600 11px var(--font-ui); letter-spacing: .08em; text-transform: uppercase; font-style: normal; opacity: .85; margin-bottom: 2px; }
 
 .sec { padding: 16px 20px; border-bottom: 1px solid var(--ui-line); }
@@ -268,7 +275,7 @@ button { font: inherit; color: inherit; }
   position: absolute; z-index: 3;
   right: max(16px, env(safe-area-inset-right, 0px));
   bottom: calc(28px + env(safe-area-inset-bottom, 0px));
-  display: grid; gap: 8px;
+  display: grid; gap: 8px; justify-items: end;
 }
 .ctl {
   width: 42px; height: 42px; border-radius: 10px; border: 0; background: var(--ui-bg); box-shadow: var(--shadow);
@@ -277,6 +284,31 @@ button { font: inherit; color: inherit; }
 .ctl:hover { background: var(--ui-hover); }
 .ctl[aria-pressed="true"] { color: var(--route); }
 .ctl[aria-pressed="false"] { color: var(--ui-muted); }
+
+/* Zoom-Regler mit Cluster-Stufen */
+.zoomgroup { display: grid; width: 42px; background: var(--ui-bg); border-radius: 10px; box-shadow: var(--shadow); }
+.zoomgroup .ctl { box-shadow: none; background: transparent; border-radius: 10px; }
+.zoomgroup .ctl:hover { background: var(--ui-hover); }
+.levels { position: relative; display: grid; padding: 4px 0; border-block: 1px solid var(--ui-line); }
+.levels::before {
+  content: ""; position: absolute; left: calc(50% - 1px); top: 17px; bottom: 17px; width: 2px; background: var(--ui-line);
+}
+.stop { position: relative; height: 28px; border: 0; background: none; cursor: pointer; display: grid; place-items: center; padding: 0; }
+.stop i {
+  position: relative; z-index: 1; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--ui-bg); border: 2px solid var(--ui-muted); transition: transform .15s;
+}
+.stop.on i { background: var(--route); border-color: var(--route); transform: scale(1.35); }
+.stop:hover i { border-color: var(--route); }
+.stop span {
+  position: absolute; right: calc(100% + 10px); top: 50%; transform: translateY(-50%);
+  white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity .15s;
+  font: 600 12px var(--font-ui); padding: 3px 8px; border-radius: 6px;
+  background: var(--ui-bg); color: var(--ui-fg); box-shadow: var(--shadow);
+}
+.stop.on span { opacity: 1; background: var(--route); color: var(--ui-bg); }
+.zoomgroup:hover .stop span, .stop:focus-visible span { opacity: 1; }
+
 .scale {
   position: absolute; z-index: 3;
   right: calc(max(16px, env(safe-area-inset-right, 0px)) + 54px);
@@ -287,7 +319,7 @@ button { font: inherit; color: inherit; }
 }
 .scale i { display: block; height: 6px; border: 2px solid var(--label); border-top: 0; }
 .tip {
-  position: absolute; z-index: 6; pointer-events: none; transform: translate(-50%, calc(-100% - 14px));
+  position: absolute; z-index: 6; pointer-events: none; transform: translate(-50%, calc(-100% - 14px)); line-height: 1.35;
   background: var(--ui-fg); color: var(--ui-bg); padding: 6px 10px; border-radius: 8px; font-size: 13px;
   max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
@@ -322,6 +354,7 @@ button { font: inherit; color: inherit; }
   .sheet-close { margin-top: -14px; }
   .cover { aspect-ratio: auto; min-height: 150px; }
   .controls { top: calc(128px + env(safe-area-inset-top, 0px)); bottom: auto; }
+  #randomBtn, #ferryBtn { display: none; }
   .scale { top: calc(136px + env(safe-area-inset-top, 0px)); bottom: auto; }
   .has-panel .scale { display: none; }
   .toast { bottom: auto; top: calc(130px + env(safe-area-inset-top, 0px)); }

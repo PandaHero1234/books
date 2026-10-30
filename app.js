@@ -1,7 +1,9 @@
 // Bücherkarte – eine Weltkarte der Bücher.
-// Kontinente = Genres, Regionen = Subgenres, Orte = Bücher.
-// Straßen verbinden Nachbarn, Fährlinien verbinden thematisch verwandte Bücher
-// über Genregrenzen hinweg. Der Routenplaner sucht darauf den kürzesten Lese-Weg.
+// Hierarchie wie bei einer Cluster-Karte: Kontinent (Genre) → Region (Subgenre)
+// → Themen-Cluster (Bücher mit gemeinsamem Thema) → Ort (Buch).
+// Je nach Zoomstufe fassen Zahlenblasen Bücher zusammen und teilen sich beim
+// Hineinzoomen auf. Straßen, Hauptstraßen und Fährlinien bilden das Netz für den
+// Routenplaner.
 (() => {
   'use strict';
 
@@ -19,8 +21,11 @@
     .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const smooth = (t) => t * t * (3 - 2 * t);
+  const median = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
   const fmtYear = (y) => (y < 0 ? `${-y} v. Chr.` : String(y));
   const fmtKm = (d) => Math.round(d).toLocaleString('de-DE');
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   function hashStr(str) {
     let h = 2166136261;
@@ -33,48 +38,132 @@
   }
   const swatch = (h) => `hsl(${h} 42% 40%)`;
   const coverBg = (h) => `linear-gradient(140deg, hsl(${h} 38% 42%), hsl(${(h + 24) % 360} 44% 26%))`;
+  function jacc(a, b) {
+    let inter = 0;
+    for (const t of a.tags) if (b.tags.includes(t)) inter++;
+    return inter / (a.tags.length + b.tags.length - inter);
+  }
 
-  // ---------------------------------------------------------------- Welt aufbauen
+  // ---------------------------------------------------------------- Hierarchie
   const continents = [];
   const regions = [];
+  const themes = [];
   const books = [];
   const byId = new Map();
+  const nodes = new Map();
+  const TAG_LABEL = { ki: 'KI', ddr: 'DDR', usa: 'USA' };
+  const tagLabel = (t) => TAG_LABEL[t] || t[0].toUpperCase() + t.slice(1);
+  const KIND = { cont: 'Kontinent', region: 'Region', theme: 'Themen-Cluster' };
+
+  // Bücher einer Region nach gemeinsamen Themen gruppieren (gierig: größtes Thema zuerst).
+  // Themen, die fast alle Bücher der Region teilen, trennen nichts und werden übersprungen.
+  function groupThemes(list) {
+    const limit = list.length >= 4 ? Math.ceil(list.length * 0.75) : Infinity;
+    const total = (t) => list.filter((b) => b.tags.includes(t)).length;
+    const rest = [...list];
+    const groups = [];
+    for (;;) {
+      const cnt = new Map();
+      rest.forEach((b) => b.tags.forEach((t) => cnt.set(t, (cnt.get(t) || 0) + 1)));
+      let best = null, bc = 1;
+      [...cnt.keys()].sort().forEach((t) => { if (cnt.get(t) > bc && total(t) < limit) { bc = cnt.get(t); best = t; } });
+      if (!best) break;
+      const g = rest.filter((b) => b.tags.includes(best));
+      groups.push({ tag: best, books: g });
+      g.forEach((b) => rest.splice(rest.indexOf(b), 1));
+    }
+    // Einzelgänger dem thematisch nächsten Cluster zuordnen, sonst bleiben sie freie Orte
+    rest.forEach((b) => {
+      let best = null, bs = 0;
+      groups.forEach((g) => { const s = g.books.reduce((a, o) => a + jacc(b, o), 0) / g.books.length; if (s > bs) { bs = s; best = g; } });
+      if (best && bs >= 0.12) best.books.push(b); else groups.push({ tag: null, books: [b] });
+    });
+    return groups;
+  }
 
   DATA.continents.forEach((c) => {
-    const cont = { id: c.id, name: c.name, genre: c.genre, hue: c.hue, x: c.x, y: c.y, regions: [], books: [], shapes: [] };
+    const cont = { type: 'cont', id: c.id, name: c.name, genre: c.genre, hue: c.hue, dataX: c.x, dataY: c.y, children: [], books: [], regions: [], shapes: [], tints: [] };
     continents.push(cont);
-    const n = c.regions.length;
-    const R = n >= 4 ? 210 : n === 3 ? 182 : 150;
-    const rot = (hashStr(c.id) % 628) / 100;
-    c.regions.forEach((r, ri) => {
-      const a = rot + (ri * Math.PI * 2) / n;
-      const reg = { name: r.name, cont, idx: regions.length, x: c.x + Math.cos(a) * R, y: c.y + Math.sin(a) * R * 0.85, books: [] };
-      regions.push(reg);
-      cont.regions.push(reg);
-      r.books.forEach(([title, author, year, tags], j) => {
-        const rr = 37 * Math.sqrt(j + 0.7);
-        const ang = j * 2.39996 + ri * 1.3 + rot;
-        const b = {
-          title, author, year, tags: tags.split(' '),
-          x: reg.x + Math.cos(ang) * rr, y: reg.y + Math.sin(ang) * rr,
-          region: reg, cont, i: books.length,
-        };
+    nodes.set(cont.id, cont);
+    c.regions.forEach((r) => {
+      const reg = { type: 'region', id: 'r' + regions.length, idx: regions.length, name: r.name, cont, children: [], books: [] };
+      regions.push(reg); nodes.set(reg.id, reg);
+      cont.regions.push(reg); cont.children.push(reg);
+      const list = r.books.map(([title, author, year, tags]) => {
+        const b = { type: 'book', title, author, year, tags: tags.split(' '), region: reg, cont, theme: null, i: books.length };
         let id = slug(title);
         while (byId.has(id)) id += '-2';
         b.id = id;
         b.key = norm(`${title} ${author}`);
-        byId.set(id, b);
-        reg.books.push(b); cont.books.push(b); books.push(b);
+        byId.set(id, b); books.push(b); reg.books.push(b); cont.books.push(b);
+        return b;
       });
+      groupThemes(list).forEach((g) => {
+        if (g.books.length < 2 || !g.tag) { reg.children.push(...g.books); return; }
+        const th = { type: 'theme', id: 't' + themes.length, name: tagLabel(g.tag), tag: g.tag, region: reg, cont, children: g.books, books: g.books };
+        g.books.forEach((b) => { b.theme = th; });
+        themes.push(th); nodes.set(th.id, th); reg.children.push(th);
+      });
+      // Ein einziges Thema pro Region wäre nur eine Zwischenstufe ohne Nutzen
+      if (reg.children.length === 1 && reg.children[0].type === 'theme') {
+        const th = themes.pop();
+        nodes.delete(th.id);
+        th.books.forEach((b) => { b.theme = null; });
+        reg.children = th.children;
+      }
     });
   });
+  const parentOf = (b) => b.theme || b.region;
 
-  // Küstenlinien: Vereinigung verrauschter Kreise um Bücher, Regionen und Kontinentmitte.
+  // ---------------------------------------------------------------- Layout
+  // Kinder liegen auf einem Ring um ihren Elternknoten, Bücher als Sonnenblumen-Spirale.
+  const SP = 26;
+  function place(node) {
+    if (node.type === 'book') return 10;
+    const ch = node.children;
+    if (ch.every((c) => c.type === 'book')) {
+      const rot = hashStr(node.name) % 10;
+      ch.forEach((b, j) => {
+        const r = ch.length === 1 ? 0 : SP * Math.sqrt(j + 0.5);
+        const a = j * 2.39996 + rot;
+        b.ox = Math.cos(a) * r; b.oy = Math.sin(a) * r;
+      });
+      return SP * Math.sqrt(Math.max(0, ch.length - 0.5)) + 18;
+    }
+    const rads = ch.map(place);
+    const m = ch.length;
+    const gap = node.type === 'cont' ? 70 : 24;
+    let R = 0;
+    if (m > 1) for (let i = 0; i < m; i++) R = Math.max(R, (rads[i] + rads[(i + 1) % m] + gap) / (2 * Math.sin(Math.PI / m)));
+    const rot = (hashStr(node.name) % 628) / 100;
+    ch.forEach((c, i) => {
+      const a = rot + (i * 2 * Math.PI) / m;
+      c.ox = Math.cos(a) * R; c.oy = Math.sin(a) * R;
+    });
+    return R + Math.max(...rads);
+  }
+  continents.forEach((c) => { c.rad = place(c); });
+  // Kontinente so weit auseinanderschieben, dass sich keine Küsten berühren
+  let worldScale = 0;
+  for (let i = 0; i < continents.length; i++) for (let j = i + 1; j < continents.length; j++) {
+    const a = continents[i], b = continents[j];
+    worldScale = Math.max(worldScale, (a.rad + b.rad + 170) / Math.hypot(a.dataX - b.dataX, a.dataY - b.dataY));
+  }
+  function absolute(node) {
+    node.children.forEach((ch) => {
+      ch.x = node.x + ch.ox; ch.y = node.y + ch.oy;
+      if (ch.type !== 'book') absolute(ch);
+    });
+  }
+  continents.forEach((c) => { c.x = c.dataX * worldScale; c.y = c.dataY * worldScale; absolute(c); });
+  const seas = DATA.seas.map((s) => ({ name: s.name, x: s.x * worldScale, y: s.y * worldScale }));
+
+  // Küstenlinien: Vereinigung verrauschter Kreise um alle Knoten und Landbrücken dazwischen
   function blob(x, y, r, seed) {
     const rnd = seeded(seed);
     const p1 = rnd() * 6.28, p2 = rnd() * 6.28, p3 = rnd() * 6.28;
     const pts = [];
-    const N = 26;
+    const N = 24;
     for (let i = 0; i < N; i++) {
       const t = (i / N) * Math.PI * 2;
       const f = 1 + 0.12 * Math.sin(t * 3 + p1) + 0.07 * Math.sin(t * 5 + p2) + 0.04 * Math.sin(t * 9 + p3) + (rnd() - 0.5) * 0.06;
@@ -82,33 +171,42 @@
     }
     return pts;
   }
-  continents.forEach((cont) => {
-    const rnd = seeded(hashStr(cont.id + 'isles'));
-    cont.shapes.push(blob(cont.x, cont.y, cont.regions.length > 2 ? 110 : 80, hashStr(cont.id)));
-    cont.regions.forEach((reg, ri) => {
-      cont.shapes.push(blob(reg.x, reg.y, 82, hashStr(reg.name)));
-      cont.shapes.push(blob((reg.x + cont.x) / 2, (reg.y + cont.y) / 2, 88, hashStr(reg.name + ri)));
+  function addLand(node, out) {
+    if (node.type === 'book') { out.push(blob(node.x, node.y, 46, hashStr(node.id))); return; }
+    const r = node.type === 'theme' ? 34 : node.type === 'region' ? 62 : 90;
+    out.push(blob(node.x, node.y, r, hashStr(node.type + node.name)));
+    node.children.forEach((ch) => {
+      const steps = Math.ceil(dist(node, ch) / 55);
+      for (let i = 1; i < steps; i++) {
+        const t = i / steps;
+        out.push(blob(node.x + (ch.x - node.x) * t, node.y + (ch.y - node.y) * t, node.type === 'cont' ? 70 : 44, hashStr((ch.id || ch.name) + i)));
+      }
+      addLand(ch, out);
     });
-    cont.books.forEach((b) => cont.shapes.push(blob(b.x, b.y, 60, hashStr(b.id))));
-    // ein paar vorgelagerte Inseln
+  }
+  continents.forEach((cont) => {
+    addLand(cont, cont.shapes);
+    const rnd = seeded(hashStr(cont.id + 'isles'));
     for (let i = 0; i < 3; i++) {
       const a = rnd() * Math.PI * 2;
-      const d = 300 + rnd() * 70;
-      cont.shapes.push(blob(cont.x + Math.cos(a) * d, cont.y + Math.sin(a) * d * 0.85, 14 + rnd() * 16, hashStr(cont.id + i)));
+      const d = cont.rad + 40 + rnd() * 50;
+      cont.shapes.push(blob(cont.x + Math.cos(a) * d, cont.y + Math.sin(a) * d, 14 + rnd() * 16, hashStr(cont.id + i)));
     }
+    // Jede zweite Region leicht abgesetzt, damit Grenzen erkennbar sind
+    cont.regions.forEach((reg, ri) => {
+      if (ri % 2) return;
+      reg.books.forEach((b) => cont.tints.push(blob(b.x, b.y, 34, hashStr(b.id + 'r'))));
+      reg.children.forEach((ch) => ch.type === 'theme' && cont.tints.push(blob(ch.x, ch.y, 38, hashStr(ch.id + 'r'))));
+    });
   });
 
   const tagCount = new Map();
   books.forEach((b) => b.tags.forEach((t) => tagCount.set(t, (tagCount.get(t) || 0) + 1)));
-
-  // ---------------------------------------------------------------- Ähnlichkeit & Straßennetz
-  function jacc(a, b) {
-    let inter = 0;
-    for (const t of a.tags) if (b.tags.includes(t)) inter++;
-    return inter / (a.tags.length + b.tags.length - inter);
-  }
   const sim = (a, b) => jacc(a, b) + (a.author === b.author ? 0.5 : 0) + (a.region === b.region ? 0.08 : 0);
 
+  // ---------------------------------------------------------------- Straßennetz
+  // local = Straße innerhalb einer Region, pass = Hauptstraße zwischen Regionen,
+  // ferry = Fährlinie zwischen Kontinenten (thematisch verwandt)
   const edges = [];
   const edgeMap = new Map();
   const adj = books.map(() => []);
@@ -119,40 +217,34 @@
     if (edgeMap.has(k)) return;
     const d = dist(a, b);
     const s = Math.min(1, jacc(a, b) + (a.author === b.author ? 0.5 : 0));
-    const ferry = a.cont !== b.cont;
+    const kind = a.cont !== b.cont ? 'ferry' : a.region !== b.region ? 'pass' : 'local';
     // Fähren sind schnell, thematische Nähe verkürzt jede Strecke.
-    const w = d * (ferry ? 0.7 : 1) * (1 - 0.45 * s);
-    const e = { a, b, d, w, ferry };
+    const w = d * (kind === 'ferry' ? 0.7 : 1) * (1 - 0.45 * s);
+    const e = { a, b, d, w, kind };
     edges.push(e);
     edgeMap.set(k, e);
     adj[a.i].push([b, e]);
     adj[b.i].push([a, e]);
   }
-  // Straßen: zwei nächste Nachbarn in der Region
-  regions.forEach((reg) => reg.books.forEach((b) => {
-    reg.books.filter((o) => o !== b).sort((p, q) => dist(b, p) - dist(b, q)).slice(0, 2).forEach((o) => link(b, o));
-  }));
-  // Pässe zwischen Regionen eines Kontinents
+  const nearest = (b, list, n) => list.filter((o) => o !== b).sort((p, q) => dist(b, p) - dist(b, q)).slice(0, n);
+  themes.forEach((th) => th.books.forEach((b) => nearest(b, th.books, 1).forEach((o) => link(b, o))));
+  regions.forEach((reg) => reg.books.forEach((b) => nearest(b, reg.books, 2).forEach((o) => link(b, o))));
   continents.forEach((cont) => {
-    for (let i = 0; i < cont.regions.length; i++) {
-      for (let j = i + 1; j < cont.regions.length; j++) {
-        let best = null, bd = Infinity;
-        for (const a of cont.regions[i].books) for (const b of cont.regions[j].books) {
-          const d = dist(a, b);
-          if (d < bd) { bd = d; best = [a, b]; }
-        }
-        if (best) link(best[0], best[1]);
+    for (let i = 0; i < cont.regions.length; i++) for (let j = i + 1; j < cont.regions.length; j++) {
+      let best = null, bd = Infinity;
+      for (const a of cont.regions[i].books) for (const b of cont.regions[j].books) {
+        const d = dist(a, b);
+        if (d < bd) { bd = d; best = [a, b]; }
       }
+      if (best) link(best[0], best[1]);
     }
   });
-  // Gleiche Autor·innen, chronologisch verkettet
   const byAuthor = new Map();
   books.forEach((b) => { if (!byAuthor.has(b.author)) byAuthor.set(b.author, []); byAuthor.get(b.author).push(b); });
   byAuthor.forEach((list) => {
     list.sort((p, q) => p.year - q.year);
     for (let i = 1; i < list.length; i++) link(list[i - 1], list[i]);
   });
-  // Fährlinien: das thematisch nächste Buch auf einem anderen Kontinent
   books.forEach((b) => {
     let best = null, bs = 0.39;
     for (const o of books) {
@@ -162,7 +254,6 @@
     }
     if (best) link(b, best);
   });
-  // Zusammenhang sicherstellen: isolierte Inselgruppen an das Festland anbinden
   (function connect() {
     for (;;) {
       const seen = new Set([0]);
@@ -177,6 +268,15 @@
       link(best[0], best[1]);
     }
   })();
+  // Fährlinien zusammengefasst pro Kontinentpaar (für die Weltansicht)
+  const contFerries = new Map();
+  edges.forEach((e) => {
+    if (e.kind !== 'ferry') return;
+    const [p, q] = e.a.cont.id < e.b.cont.id ? [e.a.cont, e.b.cont] : [e.b.cont, e.a.cont];
+    const k = p.id + '|' + q.id;
+    if (!contFerries.has(k)) contFerries.set(k, { a: p, b: q, n: 0 });
+    contFerries.get(k).n++;
+  });
 
   function shortestPath(from, to) {
     const n = books.length;
@@ -206,9 +306,24 @@
     const sh = shared.length ? ` · gemeinsam: <em>${esc(shared.join(', '))}</em>` : '';
     if (a.author === b.author) return `Ebenfalls von <em>${esc(a.author)}</em>`;
     if (a.cont !== b.cont) return `Fährlinie nach ${esc(b.cont.name)}${sh}`;
-    if (a.region !== b.region) return `Über den Pass nach ${esc(b.region.name)}${sh}`;
+    if (a.region !== b.region) return `Hauptstraße nach ${esc(b.region.name)}${sh}`;
     return shared.length ? `Gemeinsam: <em>${esc(shared.join(', '))}</em>` : `Nachbarort in ${esc(b.region.name)}`;
   }
+
+  // ---------------------------------------------------------------- Zoomstufen der Cluster
+  // Ein Knoten teilt sich auf, sobald seine Kinder auf dem Bildschirm weit genug auseinander liegen.
+  const SPLIT_PX = { cont: 175, region: 88, theme: 30 };
+  function computeSplit(node, parentK) {
+    const ch = node.children;
+    let dmin = Infinity;
+    for (let i = 0; i < ch.length; i++) for (let j = i + 1; j < ch.length; j++) dmin = Math.min(dmin, dist(ch[i], ch[j]));
+    if (!isFinite(dmin)) dmin = 200;
+    node.splitK = Math.max(SPLIT_PX[node.type] / dmin, parentK * 1.45);
+    ch.forEach((c) => c.type !== 'book' && computeSplit(c, node.splitK));
+  }
+  continents.forEach((c) => computeSplit(c, 0));
+  const LEVEL_T = [median(continents.map((c) => c.splitK)), median(regions.map((r) => r.splitK)), median(themes.map((t) => t.splitK))];
+  const BAND = Math.log(1.17);
 
   // ---------------------------------------------------------------- Zustand
   const state = {
@@ -233,9 +348,10 @@
     const g = (n) => cs.getPropertyValue(n).trim();
     C = {
       ocean: g('--ocean'), oceanLine: g('--ocean-line'), shallow: g('--shallow'), coast: g('--coast'),
-      road: g('--road'), casing: g('--road-casing'), ferry: g('--ferry'),
+      road: g('--road'), casing: g('--road-casing'), highway: g('--highway'), highwayCasing: g('--highway-casing'), ferry: g('--ferry'),
       label: g('--label'), labelSoft: g('--label-soft'), halo: g('--halo'),
       pin: g('--pin'), pinInk: g('--pin-ink'), route: g('--route'),
+      bubbleText: g('--bubble-text'), bubbleRing: g('--bubble-ring'),
       landS: parseFloat(g('--land-s')) || 34, landL: parseFloat(g('--land-l')) || 85, dotL: parseFloat(g('--dot-l')) || 36,
     };
     const dark = C.landL < 50;
@@ -243,20 +359,22 @@
       c.fill = `hsl(${c.hue} ${C.landS}% ${C.landL}%)`;
       c.fill2 = `hsl(${c.hue} ${C.landS + 4}% ${C.landL + (dark ? 3 : -4)}%)`;
       c.ink = `hsl(${c.hue} ${dark ? 50 : 52}% ${C.dotL}%)`;
+      c.glow = `hsl(${c.hue} 55% ${dark ? 60 : 45}% / .22)`;
       c.text = `hsl(${c.hue} ${dark ? 30 : 40}% ${dark ? 78 : 26}%)`;
     });
     requestDraw();
   }
 
   // ---------------------------------------------------------------- Ansicht
-  const view = { cx: 1800, cy: 1350, k: 0.35 };
-  let W = 0, H = 0, dpr = 1, minK = 0.15;
-  const MAX_K = 4.5;
-  const bounds = (() => {
+  const view = { cx: 0, cy: 0, k: 0.3 };
+  let W = 0, H = 0, dpr = 1, minK = 0.1, fitK = 0.3;
+  const MAX_K = 5;
+  const boundsOf = (pts, pad = 60) => {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    books.forEach((b) => { x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x); y1 = Math.max(y1, b.y); });
-    return { x0: x0 - 170, y0: y0 - 150, x1: x1 + 170, y1: y1 + 150 };
-  })();
+    pts.forEach((p) => { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); });
+    return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+  };
+  const bounds = boundsOf(books, 190);
 
   const isMobile = () => W <= 760;
   function freeRect() {
@@ -273,37 +391,40 @@
     if (r.b - r.t < 120) r.b = r.t + 120;
     return r;
   }
+  const freeCenter = () => { const f = freeRect(); return [(f.l + f.r) / 2, (f.t + f.b) / 2]; };
   function centerFor(x, y, k) {
-    const f = freeRect();
-    return { cx: x - ((f.l + f.r) / 2 - W / 2) / k, cy: y - ((f.t + f.b) / 2 - H / 2) / k };
+    const [fx, fy] = freeCenter();
+    return { cx: x - (fx - W / 2) / k, cy: y - (fy - H / 2) / k };
   }
   function kToFit(b, pad = 40) {
     const f = freeRect();
     return clamp(Math.min((f.r - f.l - pad * 2) / (b.x1 - b.x0), (f.b - f.t - pad * 2) / (b.y1 - b.y0)), minK, MAX_K);
   }
   function fitBounds(b, maxK = 2.2, animate = true) {
-    const k = Math.min(kToFit(b), maxK);
-    flyTo((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, k, animate);
+    flyTo((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, Math.min(kToFit(b), maxK), animate);
   }
-  const boundsOf = (pts, pad = 60) => {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    pts.forEach((p) => { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); });
-    return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
-  };
+  const toScreen = (x, y) => [(x - view.cx) * view.k + W / 2, (y - view.cy) * view.k + H / 2];
+  const toWorld = (sx, sy) => [(sx - W / 2) / view.k + view.cx, (sy - H / 2) / view.k + view.cy];
 
-  let anim = null;
+  // --- Bewegung: Flug (Klick/Suche), weiches Zoomen (Mausrad/Knöpfe), Schwung nach dem Ziehen
+  let fly = null, zoomAnim = null, inertia = null;
+  function stopMotion() {
+    if (fly) { cancelAnimationFrame(fly.raf); fly = null; }
+    if (zoomAnim) { cancelAnimationFrame(zoomAnim.raf); zoomAnim = null; }
+    if (inertia) { cancelAnimationFrame(inertia.raf); inertia = null; }
+  }
   function flyTo(x, y, k, animate = true) {
     k = clamp(k, minK, MAX_K);
     const target = centerFor(x, y, k);
-    if (!animate || reduceMotion) { cancelAnim(); view.cx = target.cx; view.cy = target.cy; view.k = k; requestDraw(); return; }
+    stopMotion();
+    if (!animate || reduceMotion) { view.cx = target.cx; view.cy = target.cy; view.k = k; requestDraw(); return; }
     const s = { ...view };
     const lk0 = Math.log(s.k), lk1 = Math.log(k);
     const d = Math.hypot(target.cx - s.cx, target.cy - s.cy);
     const bump = clamp(Math.log2(1 + (d * Math.min(s.k, k)) / Math.max(W, 1)) * 0.9, 0, 1.4);
-    const dur = clamp(450 + d * 0.25, 500, 1100);
+    const dur = clamp(450 + d * Math.min(s.k, k) * 0.35 + Math.abs(lk1 - lk0) * 160, 450, 1100);
     const t0 = performance.now();
-    cancelAnim();
-    anim = { raf: 0 };
+    fly = { raf: 0 };
     const step = (now) => {
       const t = clamp((now - t0) / dur, 0, 1);
       const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -311,23 +432,57 @@
       view.cx = s.cx + (target.cx - s.cx) * e;
       view.cy = s.cy + (target.cy - s.cy) * e;
       draw();
-      if (t < 1) anim.raf = requestAnimationFrame(step); else anim = null;
+      if (t < 1) fly.raf = requestAnimationFrame(step); else fly = null;
     };
-    anim.raf = requestAnimationFrame(step);
+    fly.raf = requestAnimationFrame(step);
   }
-  function cancelAnim() { if (anim) { cancelAnimationFrame(anim.raf); anim = null; } }
-
-  function zoomAt(sx, sy, f) {
-    cancelAnim();
+  // Zoomt so, dass der Weltpunkt unter (sx, sy) an Ort und Stelle bleibt
+  function applyZoom(sx, sy, f) {
     const k = clamp(view.k * f, minK, MAX_K);
-    const wx = (sx - W / 2) / view.k + view.cx;
-    const wy = (sy - H / 2) / view.k + view.cy;
+    const [wx, wy] = toWorld(sx, sy);
     view.k = k;
     view.cx = wx - (sx - W / 2) / k;
     view.cy = wy - (sy - H / 2) / k;
-    requestDraw();
   }
-  const toScreen = (x, y) => [(x - view.cx) * view.k + W / 2, (y - view.cy) * view.k + H / 2];
+  function smoothZoomTo(targetK, sx, sy) {
+    targetK = clamp(targetK, minK, MAX_K);
+    if (fly) { cancelAnimationFrame(fly.raf); fly = null; }
+    if (inertia) { cancelAnimationFrame(inertia.raf); inertia = null; }
+    if (reduceMotion) { applyZoom(sx, sy, targetK / view.k); requestDraw(); return; }
+    if (zoomAnim) { Object.assign(zoomAnim, { k: targetK, sx, sy }); return; }
+    zoomAnim = { k: targetK, sx, sy, last: performance.now(), raf: 0 };
+    const step = (now) => {
+      const z = zoomAnim;
+      if (!z) return;
+      const dt = Math.min(64, now - z.last);
+      z.last = now;
+      const d = Math.log(z.k) - Math.log(view.k);
+      if (Math.abs(d) < 0.002) { applyZoom(z.sx, z.sy, z.k / view.k); zoomAnim = null; draw(); return; }
+      applyZoom(z.sx, z.sy, Math.exp(d * (1 - Math.exp(-dt / 80))));
+      draw();
+      z.raf = requestAnimationFrame(step);
+    };
+    zoomAnim.raf = requestAnimationFrame(step);
+  }
+  const smoothZoomBy = (f, sx, sy) => smoothZoomTo((zoomAnim ? zoomAnim.k : view.k) * f, sx, sy);
+  function startInertia(vx, vy) {
+    if (reduceMotion) return;
+    inertia = { vx, vy, last: performance.now(), raf: 0 };
+    const step = (now) => {
+      const it = inertia;
+      if (!it) return;
+      const dt = Math.min(64, now - it.last);
+      it.last = now;
+      view.cx -= (it.vx * dt) / view.k;
+      view.cy -= (it.vy * dt) / view.k;
+      const decay = Math.exp(-dt / 320);
+      it.vx *= decay; it.vy *= decay;
+      draw();
+      if (Math.hypot(it.vx, it.vy) < 0.015) { inertia = null; return; }
+      it.raf = requestAnimationFrame(step);
+    };
+    inertia.raf = requestAnimationFrame(step);
+  }
 
   function resize() {
     const r = canvas.getBoundingClientRect();
@@ -335,9 +490,15 @@
     dpr = Math.min(2, window.devicePixelRatio || 1);
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
-    minK = Math.min(0.5, (Math.min(W / (bounds.x1 - bounds.x0), H / (bounds.y1 - bounds.y0))) * 0.6);
+    fitK = Math.min(W / (bounds.x1 - bounds.x0), H / (bounds.y1 - bounds.y0));
+    minK = Math.min(fitK * 0.6, LEVEL_T[0] * 0.5);
     draw();
   }
+  // Zielzoom pro Detailstufe (für den Stufenregler)
+  const levelK = (i) => [Math.min(fitK * 1.05, LEVEL_T[0] * 0.8), LEVEL_T[0] * 1.35, LEVEL_T[1] * 1.35, LEVEL_T[2] * 1.7][i];
+  const currentLevel = () => LEVEL_T.filter((t) => view.k >= t).length;
+  // 0 = geschlossen (Zahlenblase), 1 = vollständig aufgeteilt
+  const openness = (splitK) => smooth(clamp((Math.log(view.k) - Math.log(splitK)) / (2 * BAND) + 0.5, 0, 1));
 
   // ---------------------------------------------------------------- Zeichnen
   let pending = false;
@@ -346,22 +507,29 @@
     pending = true;
     requestAnimationFrame(() => { pending = false; draw(); });
   }
-
   function polyPath(pts) {
     ctx.moveTo(pts[0], pts[1]);
     for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
     ctx.closePath();
   }
-  function edgeCtrl(e) {
-    const [lo, hi] = e.a.i < e.b.i ? [e.a, e.b] : [e.b, e.a];
-    const mx = (lo.x + hi.x) / 2, my = (lo.y + hi.y) / 2;
-    const dx = hi.x - lo.x, dy = hi.y - lo.y;
-    return [mx - dy * 0.16, my + dx * 0.16];
+  // Fährlinien als Bogen; die Richtung hängt nur vom Paar ab, nicht von der Reihenfolge
+  function curve(p, q, flip) {
+    const [lo, hi] = flip ? [q, p] : [p, q];
+    const dx = hi[0] - lo[0], dy = hi[1] - lo[1];
+    ctx.moveTo(p[0], p[1]);
+    ctx.quadraticCurveTo((lo[0] + hi[0]) / 2 - dy * 0.16, (lo[1] + hi[1]) / 2 + dx * 0.16, q[0], q[1]);
   }
-  function edgeStroke(e, from, to) {
-    ctx.moveTo(from.x, from.y);
-    if (e.ferry) { const [qx, qy] = edgeCtrl(e); ctx.quadraticCurveTo(qx, qy, to.x, to.y); } else ctx.lineTo(to.x, to.y);
+  function edgeStroke(e, from, to, drawn) {
+    const p = drawn ? [from.dx, from.dy] : [from.x, from.y];
+    const q = drawn ? [to.dx, to.dy] : [to.x, to.y];
+    if (e.kind === 'ferry') curve(p, q, from.i > to.i);
+    else { ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); }
   }
+  const bubbleR = (node, n) => (node.type === 'cont' ? 24 + 3.2 * Math.log2(Math.max(1, n)) : node.type === 'region' ? 17 + 2.8 * Math.log2(Math.max(1, n)) : 13 + 2.4 * Math.log2(Math.max(1, n)));
+  const matches = (b) => (!state.tag || b.tags.includes(state.tag)) && (!state.cont || b.cont === state.cont);
+
+  let clusters = [];
+  let shownLevel = -1;
 
   function draw() {
     if (!W) return;
@@ -370,13 +538,26 @@
     ctx.fillStyle = C.ocean;
     ctx.fillRect(0, 0, W, H);
 
+    // --- Cluster-Baum für die aktuelle Zoomstufe auflösen
+    const all = [];
+    const walk = (node, px, py, appear) => {
+      const x = px + (node.x - px) * appear, y = py + (node.y - py) * appear;
+      node.dx = x; node.dy = y;
+      if (node.type === 'book') { node.alpha = appear; return; }
+      const open = openness(node.splitK);
+      if (open < 1) all.push({ node, x, y, a: appear * (1 - open) });
+      if (open <= 0) { node.books.forEach((b) => { b.dx = x; b.dy = y; b.alpha = 0; }); return; }
+      node.children.forEach((ch) => walk(ch, x, y, open));
+    };
+    continents.forEach((c) => walk(c, c.x, c.y, 1));
+
     // --- Weltkoordinaten
     ctx.save();
     ctx.translate(W / 2, H / 2);
     ctx.scale(k, k);
     ctx.translate(-view.cx, -view.cy);
-    const vx0 = view.cx - W / 2 / k, vx1 = view.cx + W / 2 / k;
-    const vy0 = view.cy - H / 2 / k, vy1 = view.cy + H / 2 / k;
+    const [vx0, vy0] = toWorld(0, 0);
+    const [vx1, vy1] = toWorld(W, H);
 
     // Gradnetz
     ctx.strokeStyle = C.oceanLine;
@@ -387,7 +568,7 @@
     for (let y = Math.floor(vy0 / gs) * gs; y <= vy1; y += gs) { ctx.moveTo(vx0, y); ctx.lineTo(vx1, y); }
     ctx.stroke();
 
-    // Flachwasser + Küste + Land
+    // Flachwasser, Küste, Land
     ctx.lineJoin = 'round';
     ctx.beginPath();
     continents.forEach((c) => c.shapes.forEach(polyPath));
@@ -395,7 +576,6 @@
     ctx.lineWidth = 34;
     ctx.stroke();
     continents.forEach((c) => {
-      const dim = state.cont && state.cont !== c;
       ctx.beginPath();
       c.shapes.forEach(polyPath);
       ctx.strokeStyle = C.coast;
@@ -403,15 +583,11 @@
       ctx.stroke();
       ctx.fillStyle = c.fill;
       ctx.fill();
-      // Regionen leicht abgesetzt
-      c.regions.forEach((reg, ri) => {
-        if (ri % 2) return;
-        ctx.beginPath();
-        reg.books.forEach((b) => polyPath(blob(b.x, b.y, 44, hashStr(b.id + 'r'))));
-        ctx.fillStyle = c.fill2;
-        ctx.fill();
-      });
-      if (dim) {
+      ctx.beginPath();
+      c.tints.forEach(polyPath);
+      ctx.fillStyle = c.fill2;
+      ctx.fill();
+      if (state.cont && state.cont !== c) {
         ctx.globalAlpha = 0.45;
         ctx.beginPath();
         c.shapes.forEach(polyPath);
@@ -421,51 +597,71 @@
       }
     });
 
-    // Fährlinien
-    if (state.ferries && k > 0.22) {
+    // Fährlinien: in der Weltansicht gebündelt pro Kontinentpaar, danach einzeln
+    if (state.ferries) {
       ctx.setLineDash([7 / k, 6 / k]);
-      ctx.lineWidth = 1.4 / k;
       ctx.strokeStyle = C.ferry;
-      ctx.globalAlpha = clamp((k - 0.22) * 3, 0, 0.75);
-      ctx.beginPath();
-      edges.forEach((e) => { if (e.ferry) edgeStroke(e, e.a, e.b); });
-      ctx.stroke();
+      contFerries.forEach((p) => {
+        const a = 1 - openness(LEVEL_T[2]);
+        if (a < 0.02) return;
+        ctx.globalAlpha = a * 0.6;
+        ctx.lineWidth = (1 + Math.sqrt(p.n) * 0.9) / k;
+        ctx.beginPath();
+        curve([p.a.x, p.a.y], [p.b.x, p.b.y], false);
+        ctx.stroke();
+      });
+      ctx.lineWidth = 1.4 / k;
+      edges.forEach((e) => {
+        if (e.kind !== 'ferry') return;
+        const a = Math.max(e.a.alpha, e.b.alpha) * openness(LEVEL_T[2]);
+        if (a < 0.02) return;
+        ctx.globalAlpha = a * 0.45;
+        ctx.beginPath();
+        edgeStroke(e, e.a, e.b, true);
+        ctx.stroke();
+      });
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
     }
-    // Straßen
-    if (k > 0.42) {
-      const rw = clamp(1 + k * 1.6, 1.5, 6);
-      ctx.globalAlpha = clamp((k - 0.42) * 4, 0, 1);
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      edges.forEach((e) => { if (!e.ferry) edgeStroke(e, e.a, e.b); });
-      ctx.strokeStyle = C.casing;
-      ctx.lineWidth = (rw + 2) / k;
-      ctx.stroke();
-      ctx.strokeStyle = C.road;
-      ctx.lineWidth = rw / k;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
+    // Hauptstraßen zwischen Regionen (sobald Regionen sichtbar), Straßen zwischen Büchern
+    ctx.lineCap = 'round';
+    const rw = clamp(1 + k * 1.5, 1.5, 6);
+    const strokeEdges = (kind, alphaOf, casing, fill, width) => {
+      edges.forEach((e) => {
+        if (e.kind !== kind) return;
+        const a = alphaOf(e);
+        if (a < 0.02) return;
+        ctx.globalAlpha = a;
+        ctx.beginPath();
+        edgeStroke(e, e.a, e.b, true);
+        ctx.strokeStyle = casing;
+        ctx.lineWidth = (width + 2) / k;
+        ctx.stroke();
+        ctx.strokeStyle = fill;
+        ctx.lineWidth = width / k;
+        ctx.stroke();
+      });
+    };
+    strokeEdges('local', (e) => Math.min(e.a.alpha, e.b.alpha), C.casing, C.road, rw);
+    strokeEdges('pass', (e) => Math.min(openness(e.a.region.splitK), openness(e.b.region.splitK)), C.highwayCasing, C.highway, rw + 1.2);
+    ctx.globalAlpha = 1;
+
     // Verbindungen des gewählten Buchs
-    if (state.selected && !state.route && k > 0.3) {
+    if (state.selected && !state.route && state.selected.alpha > 0.5) {
       const s = state.selected;
       ctx.beginPath();
-      adj[s.i].forEach(([o, e]) => edgeStroke(e, s, o));
+      adj[s.i].forEach(([o, e]) => edgeStroke(e, s, o, true));
       ctx.strokeStyle = C.pin;
       ctx.globalAlpha = 0.55;
       ctx.lineWidth = 2.5 / k;
-      ctx.setLineDash([]);
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
-    // Route
+    // Route (immer an den echten Orten, auf jeder Zoomstufe)
     if (state.route) {
       const p = state.route;
       ctx.beginPath();
-      for (let i = 1; i < p.length; i++) edgeStroke(edgeOf(p[i - 1], p[i]), p[i - 1], p[i]);
-      ctx.lineCap = 'round';
+      for (let i = 1; i < p.length; i++) edgeStroke(edgeOf(p[i - 1], p[i]), p[i - 1], p[i], false);
       ctx.strokeStyle = C.halo;
       ctx.lineWidth = 9 / k;
       ctx.stroke();
@@ -475,7 +671,7 @@
     }
     ctx.restore();
 
-    // --- Bildschirmkoordinaten: Punkte & Beschriftung
+    // --- Bildschirmkoordinaten
     const placed = [];
     const fits = (x, y, w, h) => {
       for (const r of placed) if (x < r.x + r.w && x + w > r.x && y < r.y + r.h && y + h > r.y) return false;
@@ -483,25 +679,74 @@
       return true;
     };
     const onScreen = (sx, sy, m = 40) => sx > -m && sx < W + m && sy > -m && sy < H + m;
-    const filtered = (b) => (state.tag && !b.tags.includes(state.tag)) || (state.cont && b.cont !== state.cont);
+    const label = (text, sx, sy, font, color, align = 'left', halo = 3) => {
+      ctx.font = font;
+      ctx.textAlign = align;
+      ctx.lineJoin = 'round';
+      if (halo) { ctx.lineWidth = halo; ctx.strokeStyle = C.halo; ctx.strokeText(text, sx, sy); }
+      ctx.fillStyle = color;
+      ctx.fillText(text, sx, sy);
+    };
+    const spaced = (v) => { if ('letterSpacing' in ctx) ctx.letterSpacing = v; };
     const inRoute = new Set(state.route || []);
+    const lk = Math.log(k);
 
-    // Punkte
-    const dr = k < 0.5 ? 2.6 : k < 1.2 ? 3.8 : 5;
+    // Hintergrundnamen: Meere, Kontinente und Regionen, die schon aufgeteilt sind
+    if (k < LEVEL_T[1] && k > LEVEL_T[0] * 0.5) {
+      ctx.globalAlpha = 0.85;
+      spaced('2px');
+      seas.forEach((s) => {
+        const [sx, sy] = toScreen(s.x, s.y);
+        if (!onScreen(sx, sy, 150)) return;
+        label(s.name, sx, sy, `italic 400 ${clamp(10 + k * 8, 11, 16)}px ${getFont('map')}`, C.coast, 'center', 0);
+      });
+      spaced('0px');
+    }
+    continents.forEach((c) => {
+      const a = openness(c.splitK) * clamp((Math.log(c.splitK * 2.6) - lk) / 0.45, 0, 1);
+      if (a < 0.02) return;
+      const [sx, sy] = toScreen(c.x, c.y);
+      if (!onScreen(sx, sy, 300)) return;
+      ctx.globalAlpha = a * 0.55;
+      spaced('5px');
+      label(c.name.toUpperCase(), sx, sy, `600 ${clamp(16 + k * 14, 18, 34)}px ${getFont('map')}`, c.text, 'center', 0);
+      spaced('0px');
+    });
+    regions.forEach((r) => {
+      const a = openness(r.splitK) * clamp((Math.log(r.splitK * 2.8) - lk) / 0.45, 0, 1);
+      if (a < 0.02) return;
+      const [sx, sy] = toScreen(r.x, r.y);
+      if (!onScreen(sx, sy, 200)) return;
+      ctx.globalAlpha = a * 0.8;
+      label(r.name, sx, sy + 5, `italic 500 ${clamp(12 + k * 3, 14, 19)}px ${getFont('map')}`, r.cont.text, 'center', 3.5);
+    });
+    ctx.globalAlpha = 1;
+
+    // Orte (Bücher)
+    const poi = k >= 2.1;
+    const dr = poi ? 9 : k < 1.2 ? 4 : 5;
     books.forEach((b) => {
-      const [sx, sy] = toScreen(b.x, b.y);
+      const rb = inRoute.has(b) && b.alpha < 0.5;
+      if (b.alpha < 0.02 && !rb) return;
+      const [sx, sy] = rb ? toScreen(b.x, b.y) : toScreen(b.dx, b.dy);
       if (!onScreen(sx, sy)) return;
-      const dim = filtered(b) && !inRoute.has(b);
-      ctx.globalAlpha = dim ? 0.28 : 1;
+      const dim = !matches(b) && !inRoute.has(b);
+      ctx.globalAlpha = (rb ? 1 : b.alpha) * (dim ? 0.3 : 1);
       const hl = (state.tag && b.tags.includes(state.tag)) || inRoute.has(b);
-      const r = hl ? dr + 1.6 : dr;
+      const r = rb ? 4.5 : hl && !poi ? dr + 1.6 : dr;
       ctx.beginPath();
       ctx.arc(sx, sy, r, 0, Math.PI * 2);
       ctx.fillStyle = inRoute.has(b) ? C.route : b.cont.ink;
       ctx.fill();
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = poi ? 2 : 1.6;
       ctx.strokeStyle = C.halo;
       ctx.stroke();
+      if (poi && !rb) {
+        // kleines Buch-Symbol wie ein Kartenpunkt bei Google Maps
+        ctx.fillStyle = C.bubbleText;
+        ctx.fillRect(sx - 4.5, sy - 3.5, 4, 7);
+        ctx.fillRect(sx + 0.5, sy - 3.5, 4, 7);
+      }
       if (state.saved.has(b.id)) {
         ctx.beginPath();
         ctx.arc(sx, sy, r + 3, 0, Math.PI * 2);
@@ -512,23 +757,44 @@
     });
     ctx.globalAlpha = 1;
 
-    const label = (text, sx, sy, font, color, align = 'left', halo = 3) => {
-      ctx.font = font;
-      ctx.textAlign = align;
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = halo;
-      ctx.strokeStyle = C.halo;
-      ctx.strokeText(text, sx, sy);
-      ctx.fillStyle = color;
-      ctx.fillText(text, sx, sy);
-    };
-    const spaced = (on) => { if ('letterSpacing' in ctx) ctx.letterSpacing = on; };
+    // Cluster-Blasen mit Anzahl
+    all.sort((p, q) => p.node.books.length - q.node.books.length);
+    const hits = [];
+    all.forEach((cl) => {
+      const { node } = cl;
+      const [sx, sy] = toScreen(cl.x, cl.y);
+      if (!onScreen(sx, sy, 60) || cl.a < 0.02) return;
+      const total = node.books.length;
+      const n = state.tag || state.cont ? node.books.filter(matches).length : total;
+      const r = bubbleR(node, total) * (0.7 + 0.3 * cl.a) * clamp(k / (LEVEL_T[0] * 0.66), 0.5, 1);
+      ctx.globalAlpha = cl.a * (n === 0 ? 0.35 : 1);
+      ctx.beginPath();
+      ctx.arc(sx, sy, r + 6, 0, Math.PI * 2);
+      ctx.fillStyle = node.cont ? node.cont.glow : node.glow;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fillStyle = node.cont ? node.cont.ink : node.ink;
+      ctx.fill();
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = node === state.hover ? C.route : C.bubbleRing;
+      ctx.stroke();
+      const txt = n === total ? String(total) : `${n}/${total}`;
+      ctx.font = `700 ${node.type === 'cont' ? 15 : 13}px ${getFont('ui')}`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = C.bubbleText;
+      ctx.fillText(txt, sx, sy + (node.type === 'cont' ? 5 : 4.5));
+      cl.sx = sx; cl.sy = sy; cl.r = r;
+      if (cl.a > 0.5) hits.push(cl);
+      placed.push({ x: sx - r, y: sy - r, w: r * 2, h: r * 2 });
+    });
+    ctx.globalAlpha = 1;
+    clusters = hits;
 
     // Pins für gewähltes Buch & Routenenden
     const pins = [];
-    if (state.route) {
-      pins.push([state.route[0], 'start'], [state.route[state.route.length - 1], 'pin']);
-    } else if (state.selected) pins.push([state.selected, 'pin']);
+    if (state.route) pins.push([state.route[0], 'start'], [state.route[state.route.length - 1], 'pin']);
+    else if (state.selected) pins.push([state.selected, 'pin']);
     pins.forEach(([b, kind]) => {
       const [sx, sy] = toScreen(b.x, b.y);
       if (kind === 'start') {
@@ -549,88 +815,71 @@
       placed.push({ x: sx - 14, y: sy - 42, w: 28, h: 28 });
     });
 
-    // Kontinentnamen
-    const ca = clamp((1.05 - k) / 0.3, 0, 1);
-    if (ca > 0) {
-      ctx.globalAlpha = ca;
-      continents.forEach((c) => {
-        const [sx, sy] = toScreen(c.x, c.y);
-        if (!onScreen(sx, sy, 200)) return;
-        const size = clamp(8 + k * 48, 11, 30);
-        const name = c.name.toUpperCase();
-        spaced(`${(size * 0.12).toFixed(1)}px`);
-        ctx.font = `600 ${size}px ${getFont('map')}`;
-        const w = ctx.measureText(name).width + 8;
-        const sub = size >= 16;
-        if (!fits(sx - w / 2, sy - size - 2, w, size + (sub ? 22 : 6))) { spaced('0px'); return; }
-        label(name, sx, sy - 4, ctx.font, c.text, 'center', 4);
-        spaced('1.5px');
-        if (sub) label(c.genre.toUpperCase(), sx, sy + 14, `700 10.5px ${getFont('ui')}`, C.labelSoft, 'center', 3);
-        spaced('0px');
-      });
-      ctx.globalAlpha = 1;
-    }
-    // Meeresnamen
-    if (k < 1.4 && k > 0.2) {
-      ctx.globalAlpha = 0.85;
-      spaced('2px');
-      DATA.seas.forEach((s) => {
-        const [sx, sy] = toScreen(s.x, s.y);
-        if (!onScreen(sx, sy, 150)) return;
-        ctx.font = `italic 400 ${clamp(11 + k * 6, 12, 17)}px ${getFont('map')}`;
-        const w = ctx.measureText(s.name).width;
-        if (!fits(sx - w / 2, sy - 12, w, 16)) return;
-        label(s.name, sx, sy, `italic 400 ${clamp(11 + k * 6, 12, 17)}px ${getFont('map')}`, C.coast, 'center', 0);
-      });
-      spaced('0px');
-      ctx.globalAlpha = 1;
-    }
-    // Regionsnamen
-    const ra = Math.min(clamp((k - 0.42) / 0.2, 0, 1), clamp((2.6 - k) / 0.6, 0, 1));
-    if (ra > 0) {
-      ctx.globalAlpha = ra;
-      regions.forEach((reg) => {
-        const [sx, sy] = toScreen(reg.x, reg.y - 8);
-        if (!onScreen(sx, sy, 120)) return;
-        const font = `italic 500 ${clamp(12 + k * 3, 13, 17)}px ${getFont('map')}`;
-        ctx.font = font;
-        const w = ctx.measureText(reg.name).width;
-        if (!fits(sx - w / 2 - 4, sy - 14, w + 8, 18)) return;
-        label(reg.name, sx, sy, font, reg.cont.text, 'center', 3.5);
-      });
-      ctx.globalAlpha = 1;
-    }
-    // Buchtitel – Priorität: gewählt, Route, Hover, Themenfilter, Rest
-    const prio = [];
-    if (state.selected) prio.push(state.selected);
-    (state.route || []).forEach((b) => prio.push(b));
-    if (state.hover) prio.push(state.hover);
-    if (state.tag || state.cont) books.forEach((b) => !filtered(b) && prio.push(b));
-    if (k >= 0.95) books.forEach((b) => prio.push(b));
-    const done = new Set();
-    const showAuthor = k >= 2.1;
-    prio.forEach((b) => {
-      if (done.has(b)) return;
-      done.add(b);
-      if (k < 0.95 && !(b === state.selected || inRoute.has(b) || b === state.hover || ((state.tag || state.cont) && !filtered(b) && k > 0.55))) return;
-      if (k >= 0.95 && filtered(b) && !inRoute.has(b) && b !== state.selected && b !== state.hover) return;
-      const [sx, sy] = toScreen(b.x, b.y);
+    // Beschriftung: gewähltes Buch & Route zuerst, dann Cluster (große zuerst), dann Bücher
+    const bookLabel = (b, force) => {
+      const route = inRoute.has(b) && b.alpha < 0.85;
+      if (!route && b.alpha < 0.85 && !force) return;
+      const [sx, sy] = route || force ? toScreen(b.x, b.y) : toScreen(b.dx, b.dy);
       if (!onScreen(sx, sy, 0)) return;
-      const important = b === state.selected || b === state.hover || (state.route && (b === state.route[0] || b === state.route[state.route.length - 1]));
       let t = b.title;
-      const max = k < 1.8 && !important ? 26 : 60;
+      const max = k < 1.8 && !force ? 26 : 60;
       if (t.length > max) t = t.slice(0, max - 1).trimEnd() + '…';
-      const font = `${important ? 700 : 600} ${important ? 13.5 : 12.5}px ${getFont('ui')}`;
+      const font = `${force ? 700 : 600} ${force ? 13.5 : 12.5}px ${getFont('ui')}`;
       ctx.font = font;
       const w = ctx.measureText(t).width;
-      const lx = sx + dr + 5;
-      const h = showAuthor ? 30 : 16;
-      if (!fits(lx - 2, sy - 11, w + 4, h) && !important) return;
-      label(t, lx, sy + 4, font, C.label, 'left', 3.5);
-      if (showAuthor) label(b.author, lx, sy + 18, `500 11.5px ${getFont('ui')}`, C.labelSoft, 'left', 3);
+      const off = poi && !route ? 12 : route ? 8 : dr + 5;
+      const showAuthor = k >= 2.4;
+      if (!fits(sx + off - 2, sy - 11, w + 4, showAuthor ? 30 : 16) && !force) return;
+      label(t, sx + off, sy + 4, font, C.label, 'left', 3.5);
+      if (showAuthor) label(b.author, sx + off, sy + 18, `500 11.5px ${getFont('ui')}`, C.labelSoft, 'left', 3);
+    };
+    const done = new Set();
+    const first = [];
+    if (state.selected) first.push([state.selected, true]);
+    if (state.route) { first.push([state.route[0], true], [state.route[state.route.length - 1], true]); state.route.forEach((b) => first.push([b, false])); }
+    if (state.hover && state.hover.type === 'book') first.push([state.hover, true]);
+    first.forEach(([b, force]) => { if (!done.has(b)) { done.add(b); bookLabel(b, force); } });
+
+    [...clusters].reverse().forEach((cl) => {
+      const { node, sx, sy, r } = cl;
+      ctx.globalAlpha = clamp((cl.a - 0.5) * 2, 0, 1);
+      if (node.type === 'cont') {
+        spaced('2.5px');
+        const font = `600 ${clamp(12 + k * 14, 14, 20)}px ${getFont('map')}`;
+        ctx.font = font;
+        const w = ctx.measureText(node.name.toUpperCase()).width;
+        if (fits(sx - w / 2, sy + r + 4, w, 34)) {
+          label(node.name.toUpperCase(), sx, sy + r + 20, font, node.text, 'center', 4);
+          spaced('1.2px');
+          label(node.genre.toUpperCase(), sx, sy + r + 34, `700 10px ${getFont('ui')}`, C.labelSoft, 'center', 3);
+        }
+        spaced('0px');
+      } else {
+        const font = node.type === 'region' ? `italic 600 15px ${getFont('map')}` : `700 12.5px ${getFont('ui')}`;
+        ctx.font = font;
+        const w = ctx.measureText(node.name).width;
+        if (fits(sx - w / 2 - 2, sy + r + 3, w + 4, 17)) label(node.name, sx, sy + r + 16, font, node.type === 'region' ? node.cont.text : C.label, 'center', 3.5);
+      }
+    });
+    ctx.globalAlpha = 1;
+    const filterOn = state.tag || state.cont;
+    books.forEach((b) => {
+      if (done.has(b) || b.alpha < 0.85) return;
+      if (filterOn && !matches(b)) return;
+      if (!filterOn && k < LEVEL_T[2] * 1.15) return;
+      bookLabel(b, false);
     });
 
     updateScale();
+    const lvl = currentLevel();
+    if (lvl !== shownLevel) {
+      shownLevel = lvl;
+      document.querySelectorAll('#levels .stop').forEach((el) => {
+        const on = +el.dataset.level === lvl;
+        el.classList.toggle('on', on);
+        el.setAttribute('aria-pressed', String(on));
+      });
+    }
   }
 
   let fontsReady = false;
@@ -650,12 +899,18 @@
   // ---------------------------------------------------------------- Eingabe auf der Karte
   const pointers = new Map();
   let drag = null;
+  let lastTap = null;
   const tip = $('#tip');
 
   function hit(sx, sy) {
+    for (let i = clusters.length - 1; i >= 0; i--) {
+      const cl = clusters[i];
+      if ((cl.sx - sx) ** 2 + (cl.sy - sy) ** 2 <= (cl.r + 4) ** 2) return cl.node;
+    }
     let best = null, bd = 14 * 14;
     books.forEach((b) => {
-      const [x, y] = toScreen(b.x, b.y);
+      if (b.alpha < 0.6) return;
+      const [x, y] = toScreen(b.dx, b.dy);
       const d = (x - sx) ** 2 + (y - sy) ** 2;
       if (d < bd) { bd = d; best = b; }
     });
@@ -667,9 +922,8 @@
     canvas.setPointerCapture(e.pointerId);
     const [x, y] = local(e);
     pointers.set(e.pointerId, { x, y });
-    cancelAnim();
-    if (pointers.size === 1) drag = { x, y, sx: x, sy: y, moved: 0 };
-    else drag = null;
+    stopMotion();
+    drag = pointers.size === 1 ? { sx: x, sy: y, moved: 0, samples: [{ x, y, t: performance.now() }] } : null;
     hideTip();
   });
   canvas.addEventListener('pointermove', (e) => {
@@ -682,14 +936,14 @@
     if (pointers.size === 2) {
       const [a, b] = [...pointers.values()];
       const d0 = Math.hypot(a.x - b.x, a.y - b.y);
-      const mid0 = [(a.x + b.x) / 2, (a.y + b.y) / 2];
+      const m0 = [(a.x + b.x) / 2, (a.y + b.y) / 2];
       pointers.set(e.pointerId, { x, y });
       const [c, d] = [...pointers.values()];
       const d1 = Math.hypot(c.x - d.x, c.y - d.y);
-      const mid1 = [(c.x + d.x) / 2, (c.y + d.y) / 2];
-      view.cx -= (mid1[0] - mid0[0]) / view.k;
-      view.cy -= (mid1[1] - mid0[1]) / view.k;
-      if (d0 > 0) zoomAt(mid1[0], mid1[1], d1 / d0);
+      const m1 = [(c.x + d.x) / 2, (c.y + d.y) / 2];
+      view.cx -= (m1[0] - m0[0]) / view.k;
+      view.cy -= (m1[1] - m0[1]) / view.k;
+      if (d0 > 0) applyZoom(m1[0], m1[1], d1 / d0);
       requestDraw();
       return;
     }
@@ -698,59 +952,107 @@
     view.cx -= (x - prev.x) / view.k;
     view.cy -= (y - prev.y) / view.k;
     drag.moved = Math.max(drag.moved, Math.hypot(x - drag.sx, y - drag.sy));
+    const now = performance.now();
+    drag.samples.push({ x, y, t: now });
+    while (drag.samples.length > 2 && now - drag.samples[0].t > 90) drag.samples.shift();
     if (drag.moved > 4) canvas.classList.add('dragging');
     requestDraw();
   });
   const endPointer = (e) => {
-    const wasDrag = drag;
+    const d = drag;
     pointers.delete(e.pointerId);
     canvas.classList.remove('dragging');
-    if (e.type === 'pointerup' && wasDrag && wasDrag.moved < 6 && pointers.size === 0) {
-      const [x, y] = local(e);
-      const b = hit(x, y);
-      if (b) selectBook(b);
-    }
     drag = null;
+    if (e.type !== 'pointerup' || !d || pointers.size) return;
+    const [x, y] = local(e);
+    if (d.moved >= 6) {
+      // Schwung mitnehmen
+      const s = d.samples;
+      const a = s[0], b = s[s.length - 1];
+      const dt = b.t - a.t;
+      if (dt > 0 && performance.now() - b.t < 60) {
+        const vx = (b.x - a.x) / dt, vy = (b.y - a.y) / dt;
+        if (Math.hypot(vx, vy) > 0.25) startInertia(vx, vy);
+      }
+      return;
+    }
+    const target = hit(x, y);
+    if (e.pointerType !== 'mouse' && !target) {
+      const now = performance.now();
+      if (lastTap && now - lastTap.t < 320 && Math.hypot(x - lastTap.x, y - lastTap.y) < 30) {
+        smoothZoomBy(2, x, y);
+        lastTap = null;
+        return;
+      }
+      lastTap = { t: now, x, y };
+    }
+    if (!target) return;
+    if (target.type === 'book') selectBook(target);
+    else openCluster(target);
   };
   canvas.addEventListener('pointerup', endPointer);
   canvas.addEventListener('pointercancel', endPointer);
-  canvas.addEventListener('pointerleave', () => { if (!pointers.size) { state.hover = null; hideTip(); requestDraw(); } });
+  canvas.addEventListener('pointerleave', () => { if (!pointers.size) { setHover(null); hideTip(); } });
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     const [x, y] = local(e);
-    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
-    zoomAt(x, y, Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0018)));
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+    smoothZoomBy(Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0028)), x, y);
   }, { passive: false });
   canvas.addEventListener('dblclick', (e) => {
     const [x, y] = local(e);
-    zoomAt(x, y, 2);
+    if (hit(x, y)) return;
+    smoothZoomBy(e.shiftKey ? 0.5 : 2, x, y);
   });
   canvas.addEventListener('keydown', (e) => {
     const step = 90 / view.k;
     const keys = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
-    if (keys[e.key]) { e.preventDefault(); view.cx += keys[e.key][0]; view.cy += keys[e.key][1]; requestDraw(); }
-    else if (e.key === '+' || e.key === '=') zoomAt(W / 2, H / 2, 1.4);
-    else if (e.key === '-') zoomAt(W / 2, H / 2, 1 / 1.4);
+    if (keys[e.key]) { e.preventDefault(); stopMotion(); view.cx += keys[e.key][0]; view.cy += keys[e.key][1]; requestDraw(); }
+    else if (e.key === '+' || e.key === '=') smoothZoomBy(2, ...freeCenter());
+    else if (e.key === '-') smoothZoomBy(0.5, ...freeCenter());
   });
 
+  function setHover(n) { if (n !== state.hover) { state.hover = n; requestDraw(); } }
   function hoverAt(x, y) {
-    const b = hit(x, y);
-    canvas.classList.toggle('over', !!b);
-    if (b !== state.hover) { state.hover = b; requestDraw(); }
-    if (b) {
-      const [sx, sy] = toScreen(b.x, b.y);
-      tip.innerHTML = `${esc(b.title)} <small>· ${esc(b.author)}</small>`;
-      tip.style.left = `${sx}px`;
-      tip.style.top = `${sy}px`;
-      tip.hidden = false;
-    } else hideTip();
+    const n = hit(x, y);
+    canvas.classList.toggle('over', !!n);
+    setHover(n);
+    if (!n) { hideTip(); return; }
+    let sx, sy;
+    if (n.type === 'book') {
+      [sx, sy] = toScreen(n.dx, n.dy);
+      tip.innerHTML = `${esc(n.title)} <small>· ${esc(n.author)}</small>`;
+    } else {
+      const cl = clusters.find((c) => c.node === n);
+      sx = cl.sx; sy = cl.sy - cl.r + 6;
+      const list = n.books.slice(0, 3).map((b) => b.title).join(', ');
+      tip.innerHTML = `<b>${esc(n.name)}</b> <small>· ${KIND[n.type]} · ${plural(n.books.length, 'Buch', 'Bücher')}</small><br><small>${esc(list)}${n.books.length > 3 ? ' …' : ''}</small>`;
+    }
+    tip.style.left = `${sx}px`;
+    tip.style.top = `${sy}px`;
+    tip.hidden = false;
   }
   function hideTip() { tip.hidden = true; }
 
+  // Klick auf eine Zahlenblase: hineinzoomen, bis sie sich aufteilt
+  function zoomIntoNode(node) {
+    const fit = kToFit(boundsOf(node.books, 50));
+    const k = clamp(Math.max(node.splitK * 1.4, Math.min(fit, node.splitK * 1.7)), minK, MAX_K);
+    flyTo(node.x, node.y, k);
+  }
+  function openCluster(node) {
+    if (isMobile() || state.route) { zoomIntoNode(node); return; }
+    showNode(node);
+  }
+
   // ---------------------------------------------------------------- Steuerelemente
-  $('#zoomIn').onclick = () => zoomAt(W / 2, H / 2, 1.5);
-  $('#zoomOut').onclick = () => zoomAt(W / 2, H / 2, 1 / 1.5);
-  $('#worldBtn').onclick = () => { state.cont = null; state.tag = null; renderChips(); fitBounds(bounds, 1); };
+  $('#zoomIn').onclick = () => smoothZoomBy(2, ...freeCenter());
+  $('#zoomOut').onclick = () => smoothZoomBy(0.5, ...freeCenter());
+  $('#levels').addEventListener('click', (e) => {
+    const stop = e.target.closest('[data-level]');
+    if (stop) smoothZoomTo(levelK(+stop.dataset.level), ...freeCenter());
+  });
+  $('#worldBtn').onclick = () => { state.cont = null; state.tag = null; renderChips(); fitBounds(bounds, levelK(0)); };
   $('#randomBtn').onclick = () => {
     let b;
     do b = books[Math.floor(Math.random() * books.length)]; while (b === state.selected);
@@ -772,7 +1074,6 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, 2400);
   }
 
-  // Chips
   function renderChips() {
     $('#chips').innerHTML = continents.map((c) =>
       `<button class="chip${state.cont === c ? ' on' : ''}" type="button" data-cont="${c.id}"><i style="background:${swatch(c.hue)}"></i>${esc(c.genre)}</button>`).join('');
@@ -780,9 +1081,9 @@
   $('#chips').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-cont]');
     if (!btn) return;
-    const c = continents.find((x) => x.id === btn.dataset.cont);
+    const c = nodes.get(btn.dataset.cont);
     if (state.cont === c) { state.cont = null; renderChips(); showHome(); return; }
-    showContinent(c);
+    showNode(c);
   });
 
   // ---------------------------------------------------------------- Suche
@@ -805,11 +1106,11 @@
     if (!n) {
       if (booksOnly) return [...state.saved].map((id) => ({ type: 'book', b: byId.get(id) })).slice(0, 6);
       const saved = [...state.saved].slice(0, 4).map((id) => ({ type: 'book', b: byId.get(id) }));
-      return [...saved, ...continents.slice(0, 8 - saved.length).map((c) => ({ type: 'cont', c }))];
+      return [...saved, ...continents.slice(0, 8 - saved.length).map((c) => ({ type: 'node', node: c }))];
     }
     if (!booksOnly) {
-      continents.forEach((c) => { const s = Math.max(score(norm(c.name), n), score(norm(c.genre), n)); if (s) out.push({ type: 'cont', c, s: s + 0.5 }); });
-      regions.forEach((r) => { const s = score(norm(r.name), n); if (s) out.push({ type: 'region', r, s: s + 0.3 }); });
+      continents.forEach((c) => { const s = Math.max(score(norm(c.name), n), score(norm(c.genre), n)); if (s) out.push({ type: 'node', node: c, s: s + 0.5 }); });
+      regions.forEach((r) => { const s = score(norm(r.name), n); if (s) out.push({ type: 'node', node: r, s: s + 0.3 }); });
       tagCount.forEach((cnt, t) => { const s = score(norm(t), n); if (s >= 2) out.push({ type: 'tag', t, cnt, s: s + 0.2 }); });
     }
     books.forEach((b) => {
@@ -826,6 +1127,7 @@
     if (i < 0) return esc(text);
     return esc(text.slice(0, i)) + '<mark>' + esc(text.slice(i, i + n.length)) + '</mark>' + esc(text.slice(i + n.length));
   }
+  const initial = (s) => esc((s.replace(/^[^\p{L}\d]+/u, '')[0] || '?').toUpperCase());
   function showSuggest(input) {
     sugTarget = input;
     const booksOnly = input !== q;
@@ -837,10 +1139,20 @@
     } else {
       sug.innerHTML = sugItems.map((it, i) => {
         let ico, title, sub;
-        if (it.type === 'book') { ico = `<span class="ico" style="background:${swatch(it.b.cont.hue)}">${state.saved.has(it.b.id) ? '★' : esc(it.b.title.replace(/^[^\p{L}\d]+/u, '')[0] || '?')}</span>`; title = hl(it.b.title, v); sub = `${hl(it.b.author, v)} · ${esc(it.b.region.name)}`; }
-        else if (it.type === 'cont') { ico = `<span class="ico" style="background:${swatch(it.c.hue)}">${esc(it.c.name[0])}</span>`; title = hl(it.c.name, v); sub = `Kontinent · ${esc(it.c.genre)} · ${it.c.books.length} Bücher`; }
-        else if (it.type === 'region') { ico = `<span class="ico" style="background:${swatch(it.r.cont.hue)}">${esc(it.r.name[0])}</span>`; title = hl(it.r.name, v); sub = `Region in ${esc(it.r.cont.name)} · ${it.r.books.length} Bücher`; }
-        else { ico = '<span class="ico" style="background:var(--ui-muted)">#</span>'; title = hl(it.t, v); sub = `Thema · ${it.cnt} Bücher`; }
+        if (it.type === 'book') {
+          ico = `<span class="ico" style="background:${swatch(it.b.cont.hue)}">${state.saved.has(it.b.id) ? '★' : initial(it.b.title)}</span>`;
+          title = hl(it.b.title, v);
+          sub = `${hl(it.b.author, v)} · ${esc(it.b.region.name)}`;
+        } else if (it.type === 'node') {
+          const nd = it.node;
+          ico = `<span class="ico" style="background:${swatch(nd.cont ? nd.cont.hue : nd.hue)}">${nd.books.length}</span>`;
+          title = hl(nd.name, v);
+          sub = nd.type === 'cont' ? `Kontinent · ${esc(nd.genre)}` : `Region in ${esc(nd.cont.name)}`;
+        } else {
+          ico = '<span class="ico" style="background:var(--ui-muted)">#</span>';
+          title = hl(it.t, v);
+          sub = `Thema · ${plural(it.cnt, 'Buch', 'Bücher')}`;
+        }
         return `<button type="button" class="sug${i === sugActive ? ' active' : ''}" role="option" data-i="${i}">${ico}<span class="txt"><b>${title}</b><small>${sub}</small></span></button>`;
       }).join('');
     }
@@ -852,8 +1164,7 @@
     if (!it) return;
     if (sugTarget === q) {
       if (it.type === 'book') { q.value = it.b.title; selectBook(it.b); }
-      else if (it.type === 'cont') { q.value = it.c.name; showContinent(it.c); }
-      else if (it.type === 'region') { q.value = it.r.name; showRegion(it.r); }
+      else if (it.type === 'node') { q.value = it.node.name; showNode(it.node); }
       else { q.value = it.t; showTag(it.t); }
       q.blur();
     } else if (it.type === 'book') {
@@ -908,10 +1219,13 @@
       setTimeout(() => empty.focus(), 30);
     }
   }
-  function closeRoute() {
+  function closeRouteForm() {
     routeform.hidden = true;
     panel.classList.remove('route-open');
     $('#routeBtn').setAttribute('aria-pressed', 'false');
+  }
+  function closeRoute() {
+    closeRouteForm();
     const had = state.route;
     state.route = null;
     hideSuggest();
@@ -951,6 +1265,7 @@
     share: '<svg viewBox="0 0 24 24" width="20" height="20"><path d="M3.9 12a3.1 3.1 0 013.1-3.1h4V7H7a5 5 0 000 10h4v-1.9H7A3.1 3.1 0 013.9 12zM8 13h8v-2H8zm9-6h-4v1.9h4a3.1 3.1 0 010 6.2h-4V17h4a5 5 0 000-10z" fill="currentColor"/></svg>',
     close: '<svg viewBox="0 0 24 24" width="18" height="18"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z" fill="currentColor"/></svg>',
     dice: '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M10.6 9.2L5.4 4 4 5.4l5.2 5.2zM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4zm.3 9.4l-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2z" fill="currentColor"/></svg>',
+    layers: '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 18.5l-7.4-5.7L3 14l9 7 9-7-1.6-1.2zM12 16l7.4-5.7L21 9l-9-7-9 7 1.6 1.3z" fill="currentColor"/></svg>',
   };
 
   function setPanel(html, viewName) {
@@ -978,6 +1293,11 @@
       <span class="rt"><b>${esc(b.title)}</b><small>${esc(b.author)} · ${fmtYear(b.year)}</small></span>
       ${right ? `<span class="rd">${right}</span>` : ''}</button>`;
 
+  function fantasyStats() {
+    const c = nodes.get('fantasy');
+    const nThemes = themes.filter((t) => t.cont === c).length;
+    return `${plural(c.regions.length, 'Region', 'Regionen')}, ${nThemes} Themen-Cluster, ${c.books.length} Bücher`;
+  }
   function showHome() {
     state.selected = null; state.tag = null; state.cont = null;
     renderChips();
@@ -986,11 +1306,12 @@
     setPanel(`
       <div class="sec intro">
         <h1>Bücherkarte</h1>
-        <p>${books.length} Bücher auf ${continents.length} Kontinenten. Jedes Genre ist ein Kontinent, jedes Buch ein Ort. Straßen verbinden Nachbarn, gestrichelte Fährlinien verbinden verwandte Themen über Genregrenzen hinweg.</p>
+        <p>${books.length} Bücher auf ${continents.length} Kontinenten. Zahlenblasen fassen Bücher zusammen: erst nach Genre, dann nach Subgenre, dann nach gemeinsamem Thema. Zoom hinein, und sie teilen sich bis zu den einzelnen Büchern auf.</p>
       </div>
       <div class="sec">
         <h3>Ausprobieren</h3>
         <div class="stack">
+          <button class="cta" type="button" data-node="fantasy">${ICON.layers}<span><b>In Drachenland hineinzoomen</b><small>Fantasy · ${fantasyStats()}</small></span></button>
           <button class="cta" type="button" data-act="demo">${ICON.route}<span><b>Lese-Route: Der Hobbit → Eine kurze Geschichte der Zeit</b><small>Vom Auenland bis ans Ende des Universums</small></span></button>
           <button class="cta" type="button" data-act="random">${ICON.dice}<span><b>Zufälliges Buch entdecken</b><small>Lass dich irgendwo auf der Karte absetzen</small></span></button>
         </div>
@@ -998,9 +1319,9 @@
       ${saved.length ? `<div class="sec"><h3>Gemerkt · ${saved.length}</h3><div class="list">${saved.map((b) => row(b)).join('')}</div></div>` : ''}
       <div class="sec">
         <h3>Kontinente</h3>
-        <div class="legend">${continents.map((c) => `<button type="button" data-cont="${c.id}"><i style="background:${swatch(c.hue)}"></i><span><b>${esc(c.name)}</b><small>${esc(c.genre)} · ${c.books.length}</small></span></button>`).join('')}</div>
+        <div class="legend">${continents.map((c) => `<button type="button" data-node="${c.id}"><i style="background:${swatch(c.hue)}"></i><span><b>${esc(c.name)}</b><small>${esc(c.genre)} · ${c.books.length}</small></span></button>`).join('')}</div>
       </div>
-      <div class="sec hint">Tipp: <span class="kbd">/</span> öffnet die Suche, Mausrad oder zwei Finger zoomen, Doppelklick zoomt hinein.</div>`, 'home');
+      <div class="sec hint">Tipp: Mausrad oder zwei Finger zoomen, Doppelklick zoomt hinein, <span class="kbd">/</span> öffnet die Suche. Der Regler rechts springt direkt zu Kontinenten, Regionen, Themen oder Büchern.</div>`, 'home');
     panel.classList.add('home');
     requestDraw();
   }
@@ -1019,31 +1340,29 @@
     if (state.tag && !b.tags.includes(state.tag)) state.tag = null;
     setHash('buch-' + b.id);
     renderBook(b);
-    if (opts.fly !== false) flyTo(b.x, b.y, Math.max(view.k, 1.5));
+    if (opts.fly !== false) flyTo(b.x, b.y, Math.max(view.k, parentOf(b).splitK * 1.6, 1.4));
     requestDraw();
-  }
-  function closeRouteForm() {
-    routeform.hidden = true;
-    panel.classList.remove('route-open');
-    $('#routeBtn').setAttribute('aria-pressed', 'false');
   }
 
   function renderBook(b) {
     const isSaved = state.saved.has(b.id);
     const more = books.filter((o) => o.author === b.author && o !== b);
     const olUrl = `https://openlibrary.org/search?q=${encodeURIComponent(b.title + ' ' + b.author)}`;
+    const crumb = [b.cont, b.region, b.theme].filter(Boolean)
+      .map((n) => `<button class="linkbtn" type="button" data-node="${n.id}">${esc(n.name)}</button>`).join(' › ');
     setPanel(`
       <div class="cover" style="background:${coverBg(b.cont.hue)}">
         <div class="book" id="bookCover" style="background:${coverBg((b.cont.hue + 12) % 360)}"><span class="bt">${esc(b.title)}</span><span class="ba">${esc(b.author)}</span></div>
-        <div class="where"><small>${esc(b.cont.genre)}</small>${esc(b.region.name)}<br>${esc(b.cont.name)}</div>
+        <div class="where"><small>${esc(b.cont.genre)}</small>${esc(b.region.name)}${b.theme ? `<br>Thema: ${esc(b.theme.name)}` : ''}</div>
       </div>
       <div class="sec">
         <h2>${esc(b.title)}</h2>
         <p class="meta"><button class="linkbtn" type="button" data-author="${esc(b.author)}">${esc(b.author)}</button> · ${fmtYear(b.year)}</p>
-        <div class="facts" id="facts"><span>Koordinaten <b>${Math.round(b.x)} / ${Math.round(b.y)}</b></span><span><b>${adj[b.i].length}</b> Verbindungen</span></div>
+        <p class="meta" style="font-size:13.5px">${crumb}</p>
+        <div class="facts" id="facts"><span><b>${adj[b.i].length}</b> Verbindungen</span><span>Koordinaten <b>${Math.round(b.x)} / ${Math.round(b.y)}</b></span></div>
       </div>
       <div class="actions">
-        <button class="act primary" type="button" data-act="routeTo">${'<span>' + ICON.route + '</span>'}Route hierher</button>
+        <button class="act primary" type="button" data-act="routeTo"><span>${ICON.route}</span>Route hierher</button>
         <button class="act" type="button" data-act="routeFrom"><span>${ICON.start}</span>Von hier</button>
         <button class="act${isSaved ? ' on' : ''}" type="button" data-act="save"><span>${isSaved ? ICON.saved : ICON.save}</span>${isSaved ? 'Gemerkt' : 'Merken'}</button>
         <button class="act" type="button" data-act="share"><span>${ICON.share}</span>Link</button>
@@ -1090,26 +1409,30 @@
     }
   }
 
-  function showContinent(c) {
-    state.cont = c; state.tag = null; state.selected = null;
+  // Panel für einen Cluster (Kontinent, Region oder Thema)
+  function showNode(node, opts = {}) {
+    state.selected = null;
+    state.tag = null;
+    state.cont = node.type === 'cont' ? node : null;
     if (state.route) { state.route = null; closeRouteForm(); }
     renderChips();
     setHash('');
+    const link = (n) => `<button class="linkbtn" type="button" data-node="${n.id}">${esc(n.name)}</button>`;
+    const crumb = node.type === 'cont' ? esc(node.genre) : node.type === 'region' ? link(node.cont) : `${link(node.cont)} › ${link(node.region)}`;
+    const subs = node.children.filter((c) => c.type !== 'book');
+    const loose = node.children.filter((c) => c.type === 'book');
+    const subLabel = node.type === 'cont' ? plural(subs.length, 'Region', 'Regionen') : subs.length ? `${subs.length} Themen-Cluster` : '';
+    const section = (n) => `<div class="sec"><h3>${link(n)} · ${n.books.length}</h3><div class="list">${n.books.map((b) => row(b, n.type === 'region' && b.theme ? esc(b.theme.name) : '')).join('')}</div></div>`;
     setPanel(`
-      <div class="cover" style="background:${coverBg(c.hue)}"><div class="where"><small>Kontinent · ${esc(c.genre)}</small><span style="font-size:26px;font-weight:600;font-style:normal">${esc(c.name)}</span></div></div>
-      <div class="sec"><p class="meta">${c.books.length} Bücher in ${c.regions.length} Regionen</p></div>
-      ${c.regions.map((r) => `<div class="sec"><h3><button class="linkbtn" type="button" data-region="${r.idx}">${esc(r.name)}</button> · ${r.books.length}</h3><div class="list">${r.books.map((b) => row(b)).join('')}</div></div>`).join('')}`, 'cont');
-    fitBounds(boundsOf(c.books, 120), 1.4);
-  }
-  function showRegion(r) {
-    state.cont = r.cont; state.tag = null; state.selected = null;
-    if (state.route) { state.route = null; closeRouteForm(); }
-    renderChips();
-    setHash('');
-    setPanel(`
-      <div class="cover" style="background:${coverBg(r.cont.hue)}"><div class="where"><small>Region in ${esc(r.cont.name)}</small><span style="font-size:24px;font-weight:600;font-style:normal">${esc(r.name)}</span></div></div>
-      <div class="sec"><h3>${r.books.length} Bücher</h3><div class="list">${r.books.map((b) => row(b)).join('')}</div></div>`, 'region');
-    fitBounds(boundsOf(r.books, 80), 2.2);
+      <div class="cover" style="background:${coverBg(node.cont ? node.cont.hue : node.hue)}"><div class="where"><small>${KIND[node.type]}</small><span class="big">${esc(node.name)}</span></div></div>
+      <div class="sec">
+        <p class="meta" style="margin:0">${crumb}</p>
+        <p class="meta">${plural(node.books.length, 'Buch', 'Bücher')}${subLabel ? ` in ${subLabel}` : ''}${loose.length && subs.length ? ` und ${plural(loose.length, 'einzelnem Ort', 'einzelnen Orten')}` : ''}</p>
+      </div>
+      ${subs.map(section).join('')}
+      ${loose.length ? `<div class="sec"><h3>${subs.length ? 'Einzelne Orte' : 'Bücher'}</h3><div class="list">${loose.map((b) => row(b)).join('')}</div></div>` : ''}`, 'node');
+    if (opts.fly !== false) zoomIntoNode(node);
+    requestDraw();
   }
   function showTag(t) {
     state.tag = t; state.cont = null; state.selected = null;
@@ -1119,7 +1442,7 @@
     const list = books.filter((b) => b.tags.includes(t));
     const conts = new Set(list.map((b) => b.cont));
     setPanel(`
-      <div class="sec" style="padding-top:22px"><h3>Thema</h3><h2>${esc(t)}</h2><p class="meta">${list.length} Bücher auf ${conts.size} ${conts.size === 1 ? 'Kontinent' : 'Kontinenten'}</p></div>
+      <div class="sec" style="padding-top:22px"><h3>Thema</h3><h2>${esc(t)}</h2><p class="meta">${plural(list.length, 'Buch', 'Bücher')} auf ${plural(conts.size, 'Kontinent', 'Kontinenten')}. Die Zahlenblasen zeigen, wie viele Treffer in jedem Cluster liegen.</p></div>
       <div class="sec"><div class="list">${list.map((b) => row(b, esc(b.cont.genre))).join('')}</div></div>`, 'tag');
     fitBounds(boundsOf(list, 120), 1.6);
     requestDraw();
@@ -1129,15 +1452,16 @@
     state.selected = null; state.tag = null; state.cont = null;
     renderChips();
     setPanel(`
-      <div class="sec" style="padding-top:22px"><h3>Autor·in</h3><h2>${esc(name)}</h2><p class="meta">${list.length} ${list.length === 1 ? 'Buch' : 'Bücher'} auf der Karte</p></div>
+      <div class="sec" style="padding-top:22px"><h3>Autor·in</h3><h2>${esc(name)}</h2><p class="meta">${plural(list.length, 'Buch', 'Bücher')} auf der Karte</p></div>
       <div class="sec"><div class="list">${list.map((b) => row(b, esc(b.region.name))).join('')}</div></div>`, 'author');
-    if (list.length === 1) flyTo(list[0].x, list[0].y, Math.max(view.k, 1.5)); else fitBounds(boundsOf(list, 120), 2);
+    if (list.length === 1) flyTo(list[0].x, list[0].y, Math.max(view.k, parentOf(list[0]).splitK * 1.6));
+    else fitBounds(boundsOf(list, 120), 2);
   }
 
   function renderRoute(path) {
     let total = 0;
     let ferries = 0;
-    for (let i = 1; i < path.length; i++) { const e = edgeOf(path[i - 1], path[i]); total += e.d; if (e.ferry) ferries++; }
+    for (let i = 1; i < path.length; i++) { const e = edgeOf(path[i - 1], path[i]); total += e.d; if (e.kind === 'ferry') ferries++; }
     const conts = new Set(path.map((b) => b.cont));
     const steps = path.map((b, i) => `
       <li class="step"><span class="node"></span><div>
@@ -1147,26 +1471,25 @@
     setPanel(`
       <div class="sec" style="padding-top:22px">
         <h3>Lese-Route</h3>
-        <div class="summary"><strong>${path.length} Bücher</strong><span class="meta">${fmtKm(total)} Lese-km · ${conts.size} ${conts.size === 1 ? 'Kontinent' : 'Kontinente'}${ferries ? ` · ${ferries} ${ferries === 1 ? 'Fähre' : 'Fähren'}` : ''}</span></div>
-        <p class="meta" style="margin-top:6px">Die Route folgt Straßen zwischen Nachbarn und Fährlinien zwischen verwandten Themen. Gemeinsame Themen machen eine Etappe kürzer.</p>
+        <div class="summary"><strong>${path.length} Bücher</strong><span class="meta">${fmtKm(total)} Lese-km · ${plural(conts.size, 'Kontinent', 'Kontinente')}${ferries ? ` · ${plural(ferries, 'Fähre', 'Fähren')}` : ''}</span></div>
+        <p class="meta" style="margin-top:6px">Die Route folgt Straßen zwischen Nachbarn, Hauptstraßen zwischen Regionen und Fährlinien zwischen verwandten Themen. Gemeinsame Themen machen eine Etappe kürzer.</p>
       </div>
       <div class="sec"><ol class="steps">${steps}</ol></div>`, 'route');
     requestDraw();
   }
 
   panel.addEventListener('click', (e) => {
-    const t = e.target.closest('[data-act],[data-book],[data-tag],[data-cont],[data-region],[data-author]');
+    const t = e.target.closest('[data-act],[data-book],[data-tag],[data-node],[data-author]');
     if (!t) return;
     const d = t.dataset;
     if (d.book) {
       const b = byId.get(d.book);
-      if (state.view === 'route') { state.selected = b; flyTo(b.x, b.y, Math.max(view.k, 1.6)); requestDraw(); }
+      if (state.view === 'route') { state.selected = b; flyTo(b.x, b.y, Math.max(view.k, parentOf(b).splitK * 1.6)); requestDraw(); }
       else selectBook(b);
     } else if (d.tag) {
       if (state.tag === d.tag) { state.tag = null; if (state.selected) renderBook(state.selected); requestDraw(); }
       else showTag(d.tag);
-    } else if (d.cont) showContinent(continents.find((c) => c.id === d.cont));
-    else if (d.region) showRegion(regions[+d.region]);
+    } else if (d.node) showNode(nodes.get(d.node));
     else if (d.author) showAuthor(d.author);
     else if (d.act === 'close') closePanel();
     else if (d.act === 'expand') panel.classList.toggle('expanded');
@@ -1211,12 +1534,12 @@
   resize();
   if (!fromHash()) {
     showHome();
-    fitBounds(bounds, 1, false);
+    fitBounds(bounds, levelK(0), false);
   } else {
     const b = state.selected;
-    flyTo(b.x, b.y, 1.6, false);
+    flyTo(b.x, b.y, Math.max(parentOf(b).splitK * 1.6, 1.4), false);
   }
   if (document.fonts) document.fonts.ready.then(() => { fontsReady = true; requestDraw(); });
   // Für Tests & Neugierige
-  window.bookmap = { books, edges, continents, regions, shortestPath, selectBook, view };
+  window.bookmap = { books, edges, continents, regions, themes, shortestPath, selectBook, view, LEVEL_T, levelK };
 })();
